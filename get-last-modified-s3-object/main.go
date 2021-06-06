@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"sort"
@@ -35,8 +39,8 @@ func GetObjects(c context.Context, api S3ListObjectsAPI, input *s3.ListObjectsV2
 }
 
 func handler(request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
-	bucket := aws.String(os.Getenv("BUCKET_NAME"))
-	prefix := aws.String(os.Getenv("PREFIX"))
+	bucket := os.Getenv("BUCKET_NAME")
+	prefix := os.Getenv("PREFIX")
 	region := os.Getenv("REGION")
 
 	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
@@ -46,12 +50,12 @@ func handler(request events.APIGatewayProxyRequest) (events.APIGatewayProxyRespo
 
 	client := s3.NewFromConfig(cfg)
 
-	input := &s3.ListObjectsV2Input{
-		Bucket: bucket,
-		Prefix: prefix,
+	listInput := &s3.ListObjectsV2Input{
+		Bucket: aws.String(bucket),
+		Prefix: aws.String(prefix),
 	}
 
-	resp, err := GetObjects(context.TODO(), client, input)
+	resp, err := client.ListObjectsV2(context.TODO(), listInput)
 	if err != nil {
 		fmt.Println("Got error retrieving list of objects:")
 		fmt.Println(err)
@@ -63,18 +67,60 @@ func handler(request events.APIGatewayProxyRequest) (events.APIGatewayProxyRespo
 	})
 
 	for _, item := range resp.Contents {
-		// fmt.Println("Name:          ", *item.Key)
+		fmt.Println("Name:          ", *item.Key)
 		fmt.Println("Last modified: ", *item.LastModified)
-		// fmt.Println("Size:          ", item.Size)
-		// fmt.Println("Storage class: ", item.StorageClass)
-		// fmt.Println("")
+		fmt.Println("")
+	}
+
+	var outputBuf bytes.Buffer
+	outputBuf.WriteString(fmt.Sprintf("Last uploaded S3 object: %v/%v\n", bucket, *resp.Contents[0].Key))
+	outputBuf.WriteString(fmt.Sprintf("Last uploaded time: %v\n", *resp.Contents[0].LastModified))
+
+	objectInput := &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(*resp.Contents[0].Key),
+	}
+
+	result, err := client.GetObject(context.TODO(), objectInput)
+	if err != nil {
+		fmt.Println("Got error retrieving object:")
+		fmt.Println(err)
+		log.Fatal(err)
+	}
+	defer result.Body.Close()
+
+	gr, err := gzip.NewReader(result.Body)
+	if err != nil {
+		fmt.Println("Got error retrieving object:")
+		fmt.Println(err)
+		log.Fatal(err)
+	}
+	defer gr.Close()
+
+	b := bufio.NewReader(gr)
+	defer gr.Close()
+
+	outputBuf.WriteString("Object contents: ")
+
+	for range make([]int, 5) {
+		line, _, err := b.ReadLine()
+		fmt.Println(string(line))
+		outputBuf.Write(line)
+		outputBuf.Write([]byte{0x0A})
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			fmt.Println("Got error reading object:")
+			fmt.Println(err)
+			log.Fatal(err)
+		}
 	}
 
 	fmt.Println("Found", len(resp.Contents), "items in bucket", bucket)
 	fmt.Println("")
 
 	return events.APIGatewayProxyResponse{
-		Body:       fmt.Sprintf("Hello"),
+		Body:       fmt.Sprintf(outputBuf.String()),
 		StatusCode: 200,
 	}, nil
 }
