@@ -2,6 +2,6 @@
   "Parameters": {
     "REGION": "region",
     "BUCKET_NAME": "value1",
-    "PREFIX": "value2"
+    "ENVIRONMENT_NAME": "value2"
   }
 }
