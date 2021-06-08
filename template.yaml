@@ -25,7 +25,7 @@ Resources:
         Variables:
           REGION: VALUE
           BUCKET_NAME: VALUE
-          PREFIX: VALUE
+          ENVIRONMENT_NAME: VALUE
     Metadata:
       DockerTag: go1.x-v1
       DockerContext: ./get-last-modified-s3-object
