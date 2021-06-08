@@ -13,6 +13,8 @@ import (
 	"sort"
 	"time"
 
+	"github.com/pkg/errors"
+
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -67,73 +69,64 @@ func init() {
 }
 
 func handler(event MyEvent) (events.APIGatewayProxyResponse, error) {
-	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
-	if err != nil {
-		log.Fatal(err.Error())
-	}
-
-	client := s3.NewFromConfig(cfg)
-
 	prefix := fmt.Sprintf("%s/unit=%s/sensor=%s/%s", envName, event.UnitID, event.Sensor, time.Now().Format("year=2006/month=01/day=02"))
 
-	obj := getLastModifiedObjectInfo(client, prefix)
-	if obj.Key == nil {
-		return events.APIGatewayProxyResponse{
-			Body:       fmt.Sprintf("no object found. bucket: %s, prefix: %s", bucket, prefix),
-			StatusCode: 200,
-		}, nil
-	}
-
-	contents := getObjectBody(obj, client, *obj.Key)
-
-	res := &Response{
-		Title:        "Last uploaded S3 object",
-		Bucket:       bucket,
-		Key:          *obj.Key,
-		LastModified: *obj.LastModified,
-		Contents:     contents,
-	}
-
-	responseJson, err := json.Marshal(res)
+	result, err := getLastModifiedObjectBody(event, prefix)
 	if err != nil {
-		log.Fatal("Got error json marshal:", err)
-	}
-
-	var outputBuf bytes.Buffer
-	if _, err := outputBuf.Write(responseJson); err != nil {
-		log.Fatal("Got error WriteString:", err)
+		log.Fatalf("bucket: %s, prefix: %s, err: %s", bucket, prefix, err)
 	}
 
 	return events.APIGatewayProxyResponse{
 		Headers: map[string]string{
 			"Content-Type": "application/json",
 		},
-		Body:       fmt.Sprintf(outputBuf.String()),
+		Body:       *result,
 		StatusCode: 200,
 	}, nil
 }
 
-func getLastModifiedObjectInfo(client *s3.Client, prefix string) types.Object {
-	var (
-		lastModifiedObj types.Object
-		token           *string
-	)
+func getLastModifiedObjectBody(event MyEvent, prefix string) (*string, error) {
+	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to aws sdk configure")
+	}
+
+	client := s3.NewFromConfig(cfg)
+
+	key, time, err := getLastModifiedObjectInfo(client, prefix)
+	if err != nil {
+		return nil, err
+	}
+
+	result, err := getObjectBody(client, key)
+	if err != nil {
+		return nil, err
+	}
+
+	body, err := constructResponseBody(key, time, result)
+	if err != nil {
+		return nil, err
+	}
+
+	return body, nil
+}
+
+func getLastModifiedObjectInfo(client *s3.Client, prefix string) (*string, *time.Time, error) {
+	var lastModifiedObj types.Object
+
+	listInput := &s3.ListObjectsV2Input{
+		Bucket:            aws.String(bucket),
+		Prefix:            aws.String(prefix),
+		MaxKeys:           1000,
+		ContinuationToken: nil,
+	}
 
 	for {
-		listInput := &s3.ListObjectsV2Input{
-			Bucket:            aws.String(bucket),
-			Prefix:            aws.String(prefix),
-			MaxKeys:           1000,
-			ContinuationToken: token,
-		}
-
 		res, err := client.ListObjectsV2(context.TODO(), listInput)
 		if err != nil {
-			log.Fatal("Got error retrieving list of objects:", err)
-		}
-
-		if res.Contents == nil {
-			return *new(types.Object)
+			return nil, nil, errors.Wrap(err, "Got error retrieving list of objects")
+		} else if res.Contents == nil {
+			return nil, nil, errors.New("Object not found")
 		}
 
 		sort.Slice(res.Contents, func(i, j int) bool {
@@ -148,52 +141,78 @@ func getLastModifiedObjectInfo(client *s3.Client, prefix string) types.Object {
 			break
 		}
 
-		token = res.NextContinuationToken
+		listInput.ContinuationToken = res.NextContinuationToken
 	}
 
-	return lastModifiedObj
+	return lastModifiedObj.Key, lastModifiedObj.LastModified, nil
 }
 
-func getObjectBody(obj types.Object, client *s3.Client, key string) []MyData {
+func getObjectBody(client *s3.Client, key *string) ([]MyData, error) {
 	objectInput := &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
+		Key:    key,
 	}
 
-	result, err := client.GetObject(context.TODO(), objectInput)
+	obj, err := client.GetObject(context.TODO(), objectInput)
 	if err != nil {
-		log.Fatal("Got error retrieving object:", err)
+		return nil, errors.Wrap(err, "Got error retrieving object")
 	}
-	defer result.Body.Close()
+	defer obj.Body.Close()
 
-	gr, err := gzip.NewReader(result.Body)
+	gr, err := gzip.NewReader(obj.Body)
 	if err != nil {
-		log.Fatal("Got error retrieving object:", err)
+		return nil, errors.Wrap(err, "Got error constructing gzip Reader")
 	}
 	defer gr.Close()
 
 	b := bufio.NewReader(gr)
 
 	var (
-		contents []MyData
-		data     MyData
+		result []MyData
+		data   MyData
 	)
 
 	for range make([]int, 5) {
 		line, _, err := b.ReadLine()
+
 		if err := json.Unmarshal(line, &data); err != nil {
-			log.Fatal("Got error unmarshal data:", err)
+			return nil, errors.Wrap(err, "Got error json unmarshal")
 		}
-		contents = append(contents, data)
+
+		result = append(result, data)
 
 		if err == io.EOF {
 			break
 		} else if err != nil {
-			log.Fatal("Got error reading object:", err)
+			return nil, errors.Wrap(err, "Got error reading object")
 		}
 	}
 
-	return contents
+	return result, nil
+}
+
+func constructResponseBody(key *string, time *time.Time, result []MyData) (*string, error) {
+	res := &Response{
+		Title:        "Last uploaded S3 object",
+		Bucket:       bucket,
+		Key:          *key,
+		LastModified: *time,
+		Contents:     result,
+	}
+
+	responseJson, err := json.Marshal(res)
+	if err != nil {
+		return nil, errors.Wrap(err, "Got error json marshal")
+	}
+
+	var outputBuf bytes.Buffer
+	if _, err := outputBuf.Write(responseJson); err != nil {
+		return nil, errors.Wrap(err, "Got error WriteString")
+	}
+
+	body := outputBuf.String()
+
+	return &body, nil
 }
 
 func main() {
